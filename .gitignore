@@ -52,3 +52,11 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Azure Functions local state
+state/
+
+# User-specific files
+*.user
+.vs/
+.vscode/

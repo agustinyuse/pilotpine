@@ -1,0 +1,21 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true
+      }
+    },
+    "logLevel": {
+      "default": "Information",
+      "PilotPine": "Debug"
+    }
+  },
+  "extensions": {
+    "durableTask": {
+      "maxConcurrentActivityFunctions": 3,
+      "maxConcurrentOrchestratorFunctions": 2
+    }
+  },
+  "functionTimeout": "00:30:00"
+}
