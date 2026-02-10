@@ -14,6 +14,14 @@
     "Pinterest__AccessToken": "",
     "Pinterest__DefaultBoardId": "",
 
+    "Affiliates__BookingId": "",
+    "Affiliates__GetYourGuideId": "",
+
+    "Bannerbear__ApiKey": "",
+    "Bannerbear__Templates__travel": "",
+    "Bannerbear__Templates__listicle": "",
+    "Bannerbear__Templates__guide": "",
+
     "State__StoragePath": "./state"
   }
 }

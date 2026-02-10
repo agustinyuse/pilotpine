@@ -4,39 +4,57 @@ using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Agents;
+using Microsoft.SemanticKernel.ChatCompletion;
 using PilotPine.Functions.Infrastructure;
 using PilotPine.Functions.Models;
+using PilotPine.Functions.Tools;
 
 namespace PilotPine.Functions.Functions;
 
 /// <summary>
 /// Orquestador principal con Durable Functions.
 ///
-/// Durable Functions guarda checkpoint después de cada await.
-/// Si una tool falla, al reintentar NO repite los pasos anteriores.
+/// Approach híbrido (ver docs/TOOLS-VS-DIRECT-CALLS.md):
+///   - GetKeywords: directo (mecánico)
+///   - GenerateArticle: AGENT + TOOLS (el LLM decide estructura/contenido)
+///   - PublishToWordPress: directo (mecánico)
+///   - GenerateImages + CreatePins: directo (mecánico)
 ///
-/// Ejemplo de recovery:
-///   1. GetKeywords     ✓ (checkpoint)
-///   2. GenerateArticle ✓ (checkpoint - Claude ya cobró, no se repite)
-///   3. PublishToWP     ✗ (falla aquí)
-///   → Al reiniciar, salta directo al paso 3 con los datos guardados.
+/// Durable Functions guarda checkpoint después de cada await.
+/// Si falla en paso 3, NO repite el paso 2 (que costó tokens).
 /// </summary>
 public class DailyOrchestrator
 {
     private readonly Kernel _kernel;
     private readonly FoundryModelProvider _foundryProvider;
     private readonly StateManager _stateManager;
+    private readonly ResearchTools _researchTools;
+    private readonly ContentTools _contentTools;
+    private readonly WordPressTools _wordPressTools;
+    private readonly PinterestTools _pinterestTools;
+    private readonly ImageTools _imageTools;
     private readonly ILogger<DailyOrchestrator> _logger;
 
     public DailyOrchestrator(
         Kernel kernel,
         FoundryModelProvider foundryProvider,
         StateManager stateManager,
+        ResearchTools researchTools,
+        ContentTools contentTools,
+        WordPressTools wordPressTools,
+        PinterestTools pinterestTools,
+        ImageTools imageTools,
         ILogger<DailyOrchestrator> logger)
     {
         _kernel = kernel;
         _foundryProvider = foundryProvider;
         _stateManager = stateManager;
+        _researchTools = researchTools;
+        _contentTools = contentTools;
+        _wordPressTools = wordPressTools;
+        _pinterestTools = pinterestTools;
+        _imageTools = imageTools;
         _logger = logger;
     }
 
@@ -64,7 +82,7 @@ public class DailyOrchestrator
         _logger.LogInformation("Started orchestration: {Id}", instanceId);
     }
 
-    // ─── HTTP Trigger: Para testing manual ─────────────────────────
+    // ─── HTTP Trigger: Testing manual ──────────────────────────────
     [Function("ManualTrigger")]
     public async Task<HttpResponseData> ManualTrigger(
         [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
@@ -83,7 +101,10 @@ public class DailyOrchestrator
         return response;
     }
 
-    // ─── Orquestación Principal ────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+    // ORCHESTRATIONS
+    // ═══════════════════════════════════════════════════════════════
+
     [Function(nameof(MainOrchestration))]
     public async Task<PipelineResult> MainOrchestration(
         [OrchestrationTrigger] TaskOrchestrationContext context)
@@ -92,20 +113,16 @@ public class DailyOrchestrator
         var logger = context.CreateReplaySafeLogger<DailyOrchestrator>();
         var results = new List<ArticleResult>();
 
-        // Paso 1: Research keywords
-        // >>> Checkpoint: si falla después, no repite el research <<<
+        // Paso 1: Research keywords (directo, mecánico)
         var keywords = await context.CallActivityAsync<List<KeywordResult>>(
             nameof(GetKeywordsActivity),
             input!.ArticleCount
         );
-
         logger.LogInformation("Keywords found: {Count}", keywords.Count);
 
-        // Paso 2: Procesar cada keyword como sub-orquestación
+        // Paso 2: Procesar cada keyword (sub-orquestación con checkpoints)
         foreach (var kw in keywords)
         {
-            // Cada artículo tiene sus propios checkpoints internos.
-            // Si el pin falla, el artículo ya publicado no se repite.
             var result = await context.CallSubOrchestrationAsync<ArticleResult>(
                 nameof(ProcessArticleOrchestration),
                 new ArticleInput { Keyword = kw.Keyword, ArticleType = kw.ArticleType }
@@ -128,7 +145,6 @@ public class DailyOrchestrator
         };
     }
 
-    // ─── Sub-Orquestación por Artículo ─────────────────────────────
     [Function(nameof(ProcessArticleOrchestration))]
     public async Task<ArticleResult> ProcessArticleOrchestration(
         [OrchestrationTrigger] TaskOrchestrationContext context)
@@ -136,25 +152,20 @@ public class DailyOrchestrator
         var input = context.GetInput<ArticleInput>();
         var logger = context.CreateReplaySafeLogger<DailyOrchestrator>();
 
-        // Retry policies diferenciadas por tipo de operación
         var llmRetry = new TaskRetryOptions(
             firstRetryInterval: TimeSpan.FromSeconds(30),
             maxNumberOfAttempts: 3)
-        {
-            BackoffCoefficient = 1.5
-        };
+        { BackoffCoefficient = 1.5 };
 
         var apiRetry = new TaskRetryOptions(
             firstRetryInterval: TimeSpan.FromSeconds(10),
             maxNumberOfAttempts: 5)
-        {
-            BackoffCoefficient = 2.0,
-            MaxRetryInterval = TimeSpan.FromMinutes(3)
-        };
+        { BackoffCoefficient = 2.0, MaxRetryInterval = TimeSpan.FromMinutes(3) };
 
         try
         {
-            // Paso 1: Generar artículo (LLM - costoso, se cachea en checkpoint)
+            // Paso 1: Generar artículo con AGENT + TOOLS (LLM decide contenido)
+            // >>> Checkpoint: $0.06 de Claude, no se repite si falla después <<<
             var article = await context.CallActivityAsync<Article>(
                 nameof(GenerateArticleActivity),
                 input,
@@ -162,7 +173,14 @@ public class DailyOrchestrator
             );
             logger.LogInformation("Article generated: {Title}", article.Title);
 
-            // Paso 2: Publicar en WordPress (API externa)
+            // Paso 2: Generar imágenes para pins (directo, mecánico)
+            var pinVariations = await context.CallActivityAsync<List<PinVariation>>(
+                nameof(GeneratePinImagesActivity),
+                new PinImageInput { ArticleTitle = article.Title, Keyword = input!.Keyword }
+            );
+            logger.LogInformation("Pin images generated: {Count}", pinVariations.Count);
+
+            // Paso 3: Publicar en WordPress (directo, mecánico)
             var wpResult = await context.CallActivityAsync<PublishResult>(
                 nameof(PublishToWordPressActivity),
                 article,
@@ -171,28 +189,37 @@ public class DailyOrchestrator
 
             if (!wpResult.Success)
             {
+                logger.LogWarning("WordPress failed: {Error}", wpResult.Error);
                 return new ArticleResult
                 {
                     Success = false,
-                    Keyword = input!.Keyword,
+                    Keyword = input.Keyword,
                     Error = wpResult.Error
                 };
             }
             logger.LogInformation("Published: {Url}", wpResult.PostUrl);
 
-            // Paso 3: Crear pins (API externa)
-            var pinResult = await context.CallActivityAsync<PinResult>(
-                nameof(CreatePinActivity),
-                new { Title = article.Title, PostUrl = wpResult.PostUrl, Keyword = input!.Keyword },
+            // Paso 4: Crear pins en Pinterest (directo, mecánico)
+            var pinResults = await context.CallActivityAsync<List<PinResult>>(
+                nameof(CreatePinsActivity),
+                new CreatePinsInput
+                {
+                    PostUrl = wpResult.PostUrl!,
+                    Description = article.MetaDescription,
+                    Variations = pinVariations
+                },
                 new TaskActivityOptions { Retry = apiRetry }
             );
+
+            var successPins = pinResults.Count(p => p.Success);
+            logger.LogInformation("Pins created: {Success}/{Total}", successPins, pinResults.Count);
 
             return new ArticleResult
             {
                 Success = true,
                 Keyword = input.Keyword,
                 PostUrl = wpResult.PostUrl,
-                PinsCreated = pinResult.Success ? 1 : 0
+                PinsCreated = successPins
             };
         }
         catch (Exception ex)
@@ -207,68 +234,136 @@ public class DailyOrchestrator
         }
     }
 
-    // ─── Activities ────────────────────────────────────────────────
-    // Cada Activity es una unidad atómica de trabajo.
-    // Durable Functions serializa su output como checkpoint.
+    // ═══════════════════════════════════════════════════════════════
+    // ACTIVITIES - Cada una es una unidad atómica con checkpoint
+    // ═══════════════════════════════════════════════════════════════
 
     [Function(nameof(GetKeywordsActivity))]
     public async Task<List<KeywordResult>> GetKeywordsActivity(
         [ActivityTrigger] int count)
     {
-        // Cargar keywords ya publicadas del state
-        var published = await _stateManager.LoadAsync<HashSet<string>>("published-keywords")
-            ?? [];
-
-        // Obtener keywords del tool de research
-        var researchTools = _kernel.Plugins["Research"];
-        var result = await _kernel.InvokeAsync(
-            researchTools["GetKeywords"],
-            new() { ["count"] = count * 2 }  // Pedir el doble para filtrar
-        );
-
-        var all = result.GetValue<List<KeywordResult>>() ?? [];
-
-        // Filtrar las ya publicadas
-        return all
-            .Where(k => !published.Contains(k.Keyword.ToLowerInvariant()))
-            .Take(count)
-            .ToList();
+        // Llamada directa al ResearchTools (no necesita el LLM para esto)
+        return await _researchTools.GetKeywords(count);
     }
 
     [Function(nameof(GenerateArticleActivity))]
     public async Task<Article> GenerateArticleActivity(
         [ActivityTrigger] ArticleInput input)
     {
-        // TODO: Implementar con ChatCompletionAgent cuando ContentTools esté listo.
-        // Por ahora retorna un placeholder para que la estructura compile.
-        _logger.LogInformation("Generating article for: {Keyword}", input.Keyword);
+        // ─── Approach: Agent + Tools ────────────────────────────────
+        // Creamos un kernel específico con los ContentTools registrados.
+        // El agente (Claude) genera el contenido y llama a
+        // CreateArticleStructure para empaquetarlo.
 
-        return new Article
+        var kernel = _foundryProvider.CreateKernelForModel();
+        kernel.Plugins.AddFromObject(_contentTools, "Content");
+
+        var agent = new ChatCompletionAgent
         {
-            Title = $"Guide: {input.Keyword}",
-            Content = $"<p>Article about {input.Keyword} - pending real implementation</p>",
-            MetaDescription = $"Discover {input.Keyword}",
-            Category = "travel",
-            Tags = input.Keyword.Split(' ')
+            Name = "ContentWriter",
+            Instructions = $"""
+                You are an expert travel content writer.
+
+                Your task: Create a {input.ArticleType} article about "{input.Keyword}"
+
+                Requirements:
+                - Catchy title including the current year
+                - 1500-2000 words in HTML format
+                - Use [HOTEL_LINK] where you recommend hotels
+                - Use [TOUR_LINK] where you recommend tours/activities
+                - Meta description of max 155 characters
+                - Informative but friendly tone
+                - Include practical tips and insider knowledge
+
+                IMPORTANT: After generating the content, call the CreateArticleStructure
+                tool to save the article with all fields filled in.
+                """,
+            Kernel = kernel,
+            Arguments = new KernelArguments(
+                new PromptExecutionSettings
+                {
+                    FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
+                }
+            )
         };
+
+        var chat = new ChatHistory();
+        chat.AddUserMessage($"Write a {input.ArticleType} about: {input.Keyword}");
+
+        // El agente genera contenido y llama a CreateArticleStructure
+        Article? result = null;
+        await foreach (var response in agent.InvokeAsync(chat))
+        {
+            // Intentar extraer el Article del último tool call
+            if (response.Content != null)
+            {
+                _logger.LogDebug("Agent response: {Content}", response.Content[..Math.Min(200, response.Content.Length)]);
+            }
+        }
+
+        // Si el agente no llamó al tool, generar directamente
+        if (result == null)
+        {
+            _logger.LogWarning("Agent did not call CreateArticleStructure, using direct generation");
+
+            // Fallback: llamada directa al LLM para generar contenido
+            var chatService = kernel.GetRequiredService<IChatCompletionService>();
+            var directChat = new ChatHistory();
+            directChat.AddSystemMessage(
+                "You are a travel content writer. Write in HTML format. " +
+                "Use [HOTEL_LINK] for hotel recommendations and [TOUR_LINK] for tour recommendations.");
+            directChat.AddUserMessage(
+                $"Write a {input.ArticleType} article about: {input.Keyword}. " +
+                "Include a title, 1500 words of content, and a meta description.");
+
+            var directResponse = await chatService.GetChatMessageContentAsync(directChat);
+            var content = directResponse.Content ?? "";
+
+            result = await _contentTools.CreateArticleStructure(
+                input.Keyword,
+                input.ArticleType,
+                $"Best {input.Keyword} Guide {DateTime.UtcNow.Year}",
+                content,
+                $"Discover the best {input.Keyword}. Local tips and insider secrets."
+            );
+        }
+
+        return result;
+    }
+
+    [Function(nameof(GeneratePinImagesActivity))]
+    public async Task<List<PinVariation>> GeneratePinImagesActivity(
+        [ActivityTrigger] PinImageInput input)
+    {
+        // Directo: generar headlines y luego imágenes
+        var headlines = await _contentTools.GeneratePinHeadlines(input.ArticleTitle, 3);
+        return await _imageTools.GeneratePinVariationsAsync(input.ArticleTitle, input.Keyword, headlines);
     }
 
     [Function(nameof(PublishToWordPressActivity))]
     public async Task<PublishResult> PublishToWordPressActivity(
         [ActivityTrigger] Article article)
     {
-        // TODO: Implementar con WordPressTools
-        _logger.LogInformation("Publishing: {Title}", article.Title);
-        return new PublishResult { Success = false, Error = "WordPressTools not implemented yet" };
+        // Directo: verificar duplicado, luego publicar
+        if (await _wordPressTools.PostExistsAsync(article.Title))
+        {
+            _logger.LogWarning("Article already exists: {Title}", article.Title);
+            return new PublishResult { Success = false, Error = "Article with similar title already exists" };
+        }
+
+        return await _wordPressTools.PublishPostAsync(article);
     }
 
-    [Function(nameof(CreatePinActivity))]
-    public Task<PinResult> CreatePinActivity(
-        [ActivityTrigger] object input)
+    [Function(nameof(CreatePinsActivity))]
+    public async Task<List<PinResult>> CreatePinsActivity(
+        [ActivityTrigger] CreatePinsInput input)
     {
-        // TODO: Implementar con PinterestTools
-        _logger.LogInformation("Creating pin (not implemented yet)");
-        return Task.FromResult(new PinResult { Success = false, Error = "PinterestTools not implemented yet" });
+        // Directo: crear pins con rate limiting
+        return await _pinterestTools.CreatePinsWithRateLimitAsync(
+            input.PostUrl,
+            input.Description,
+            input.Variations
+        );
     }
 
     [Function(nameof(SaveResultsActivity))]
@@ -278,7 +373,7 @@ public class DailyOrchestrator
         var date = DateTime.UtcNow.ToString("yyyy-MM-dd");
         await _stateManager.SaveAsync($"daily-results/{date}", results);
 
-        // Actualizar lista de keywords publicadas
+        // Actualizar keywords publicadas
         var successKeywords = results
             .Where(r => r.Success)
             .Select(r => r.Keyword.ToLowerInvariant());
@@ -294,10 +389,22 @@ public class DailyOrchestrator
             }
         );
 
-        _logger.LogInformation(
-            "Daily results saved: {Success}/{Total}",
-            results.Count(r => r.Success),
-            results.Count
-        );
+        _logger.LogInformation("Results saved: {Success}/{Total}",
+            results.Count(r => r.Success), results.Count);
     }
+}
+
+// ─── Input records para Activities ──────────────────────────────
+
+public record PinImageInput
+{
+    public string ArticleTitle { get; init; } = "";
+    public string Keyword { get; init; } = "";
+}
+
+public record CreatePinsInput
+{
+    public string PostUrl { get; init; } = "";
+    public string Description { get; init; } = "";
+    public List<PinVariation> Variations { get; init; } = [];
 }

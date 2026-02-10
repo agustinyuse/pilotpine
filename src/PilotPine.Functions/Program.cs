@@ -43,16 +43,19 @@ var host = new HostBuilder()
             return new StateManager(storagePath, logger);
         });
 
-        // ─── Tools ──────────────────────────────────────────────────
-        services.AddSingleton<ResearchTools>();
-        // Más tools se agregan aquí a medida que se implementen:
-        // services.AddSingleton<ContentTools>();
-        // services.AddSingleton<ImageTools>();
-        // services.AddSingleton<WordPressTools>();
-        // services.AddSingleton<PinterestTools>();
-
-        // ─── HTTP Client ────────────────────────────────────────────
+        // ─── HTTP Client (antes de tools que lo necesitan) ──────────
         services.AddHttpClient();
+
+        // ─── Tools: Agent-facing (expuestos al LLM via Kernel) ──────
+        services.AddSingleton<ResearchTools>();
+        services.AddSingleton<ContentTools>();
+
+        // ─── Tools: Direct-call (llamados desde el orchestrator) ────
+        // Estos NO se registran como plugins del Kernel.
+        // Son llamadas directas porque publicar es mecánico.
+        services.AddSingleton<WordPressTools>();
+        services.AddSingleton<PinterestTools>();
+        services.AddSingleton<ImageTools>();
 
         // ─── Observability ──────────────────────────────────────────
         services.AddApplicationInsightsTelemetryWorkerService();
