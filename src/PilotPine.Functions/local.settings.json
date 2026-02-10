@@ -1,0 +1,19 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+
+    "Foundry__Endpoint": "https://YOUR-RESOURCE.services.ai.azure.com",
+    "Foundry__DefaultModel": "claude-sonnet-4-5",
+
+    "WordPress__Url": "",
+    "WordPress__Username": "",
+    "WordPress__AppPassword": "",
+
+    "Pinterest__AccessToken": "",
+    "Pinterest__DefaultBoardId": "",
+
+    "State__StoragePath": "./state"
+  }
+}
