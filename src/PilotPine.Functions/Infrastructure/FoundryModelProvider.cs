@@ -1,6 +1,9 @@
-using Azure.AI.Inference;
+using Azure;
+using Azure.AI.OpenAI;
 using Azure.Identity;
-using Microsoft.SemanticKernel;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using OpenAI.Chat;
 
 namespace PilotPine.Functions.Infrastructure;
 
@@ -13,60 +16,62 @@ namespace PilotPine.Functions.Infrastructure;
 ///   - mistral-large (Mistral via Foundry)
 ///   - etc.
 ///
-/// Esto permite cambiar de modelo por tarea sin cambiar la infraestructura.
-/// Por ejemplo: Claude para contenido creativo, GPT para structured output.
+/// Ahora usa AzureOpenAIClient (compatible con Foundry) en lugar de
+/// Azure.AI.Inference, y crea AIAgent del Microsoft Agent Framework.
 /// </summary>
 public class FoundryModelProvider
 {
-    private readonly string _endpoint;
+    private readonly AzureOpenAIClient _client;
     private readonly string _defaultModelId;
-    private readonly DefaultAzureCredential _credential;
 
-    public FoundryModelProvider(string endpoint, string defaultModelId)
+    public FoundryModelProvider(string endpoint, string defaultModelId, string? apiKey = null)
     {
-        _endpoint = endpoint;
         _defaultModelId = defaultModelId;
-        _credential = new DefaultAzureCredential();
+
+        _client = !string.IsNullOrEmpty(apiKey)
+            ? new AzureOpenAIClient(new Uri(endpoint), new AzureKeyCredential(apiKey))
+            : new AzureOpenAIClient(new Uri(endpoint), new DefaultAzureCredential());
     }
 
-    public string Endpoint => _endpoint;
     public string DefaultModelId => _defaultModelId;
+    public AzureOpenAIClient Client => _client;
 
     /// <summary>
-    /// Crea un Kernel de Semantic Kernel configurado para un modelo específico.
-    /// Útil cuando una activity necesita un modelo diferente al default.
+    /// Obtiene un ChatClient para un modelo específico de Foundry.
     ///
     /// Ejemplo:
-    ///   var kernel = provider.CreateKernelForModel("gpt-4o");
-    ///   // Usar GPT-4o para structured output (JSON mode)
-    ///
-    ///   var kernel = provider.CreateKernelForModel("claude-sonnet-4-5");
-    ///   // Usar Claude para contenido creativo largo
+    ///   var chat = provider.GetChatClient("gpt-4o");
+    ///   var chat = provider.GetChatClient("claude-sonnet-4-5");
     /// </summary>
-    public Kernel CreateKernelForModel(string? modelId = null)
+    public ChatClient GetChatClient(string? modelId = null)
     {
-        var builder = Kernel.CreateBuilder();
-
-        builder.AddAzureAIInferenceChatCompletion(
-            endpoint: new Uri(_endpoint),
-            credential: _credential,
-            modelId: modelId ?? _defaultModelId
-        );
-
-        return builder.Build();
+        return _client.GetChatClient(modelId ?? _defaultModelId);
     }
 
     /// <summary>
-    /// Crea un ChatCompletionsClient directo para Azure AI Inference.
-    /// Útil para llamadas directas sin Semantic Kernel (approach tradicional).
-    ///
-    /// Ver docs/TOOLS-VS-DIRECT-CALLS.md para cuándo usar cada approach.
+    /// Crea un AIAgent del Agent Framework sin tools.
+    /// Útil para agentes simples que solo necesitan instrucciones.
     /// </summary>
-    public ChatCompletionsClient CreateDirectClient()
+    public AIAgent CreateAgent(string name, string instructions, string? modelId = null)
     {
-        return new ChatCompletionsClient(
-            new Uri(_endpoint),
-            _credential
-        );
+        return GetChatClient(modelId).AsAIAgent(instructions, name);
+    }
+
+    /// <summary>
+    /// Crea un AIAgent del Agent Framework con tools.
+    /// Útil para agentes que necesitan llamar funciones.
+    /// </summary>
+    public AIAgent CreateAgentWithTools(
+        string name,
+        string instructions,
+        IServiceProvider services,
+        AIFunction[] tools,
+        string? modelId = null)
+    {
+        return GetChatClient(modelId).AsAIAgent(
+            instructions: instructions,
+            name: name,
+            services: services,
+            tools: tools);
     }
 }

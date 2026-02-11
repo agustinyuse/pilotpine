@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
 using PilotPine.Functions.Infrastructure;
 using PilotPine.Functions.Models;
 
@@ -9,11 +8,11 @@ namespace PilotPine.Functions.Tools;
 /// <summary>
 /// Tools de investigación de keywords.
 ///
-/// Estas funciones son "Tools" de Semantic Kernel: el agente (Claude/GPT)
-/// puede decidir llamarlas basándose en su nombre, descripción y parámetros.
-///
 /// Fase 1 (actual): Lista estática de keywords.
 /// Fase 2 (futuro): Integrar con Pinterest Trends API, Google Trends, etc.
+///
+/// GetKeywords se llama directamente desde el orchestrator (mecánico).
+/// MarkAsPublished se puede exponer como tool si se necesita.
 /// </summary>
 public class ResearchTools
 {
@@ -26,7 +25,6 @@ public class ResearchTools
         _logger = logger;
     }
 
-    [KernelFunction]
     [Description("Gets travel keywords for content creation. Returns keywords that haven't been published yet.")]
     public async Task<List<KeywordResult>> GetKeywords(
         [Description("Number of keywords to return")] int count = 3)
@@ -52,7 +50,6 @@ public class ResearchTools
         return available;
     }
 
-    [KernelFunction]
     [Description("Marks a keyword as published to avoid duplicates in future runs.")]
     public async Task MarkAsPublished(
         [Description("The keyword that was published")] string keyword)

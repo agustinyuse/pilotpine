@@ -6,6 +6,7 @@
 
     "Foundry__Endpoint": "https://YOUR-RESOURCE.services.ai.azure.com",
     "Foundry__DefaultModel": "claude-sonnet-4-5",
+    "Foundry__ApiKey": "",
 
     "WordPress__Url": "",
     "WordPress__Username": "",

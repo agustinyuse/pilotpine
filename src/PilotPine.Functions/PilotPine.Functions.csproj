@@ -14,14 +14,16 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker" Version="2.0.0" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.0.0" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http" Version="3.2.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.0.0" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Timer" Version="4.3.0" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.DurableTask" Version="1.1.6" />
 
-    <!-- Semantic Kernel + Foundry (multi-model) -->
-    <PackageReference Include="Microsoft.SemanticKernel" Version="1.44.0" />
-    <PackageReference Include="Microsoft.SemanticKernel.Agents.Core" Version="1.44.0" />
-    <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureAIInference" Version="1.44.0-alpha" />
-    <PackageReference Include="Azure.AI.Inference" Version="1.0.0" />
+    <!-- Microsoft Agent Framework (Durable Agents) -->
+    <PackageReference Include="Microsoft.Agents.AI.Hosting.AzureFunctions" Version="0.1.0-preview" />
+    <PackageReference Include="Microsoft.Agents.AI.OpenAI" Version="0.1.0-preview" />
+
+    <!-- Azure OpenAI + Identity (Foundry multi-model) -->
+    <PackageReference Include="Azure.AI.OpenAI" Version="2.2.0" />
     <PackageReference Include="Azure.Identity" Version="1.13.2" />
 
     <!-- Observability -->
@@ -29,6 +31,10 @@
 
     <!-- Config -->
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>

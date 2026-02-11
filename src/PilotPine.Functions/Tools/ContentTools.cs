@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
 using PilotPine.Functions.Models;
 
 namespace PilotPine.Functions.Tools;
@@ -9,8 +8,8 @@ namespace PilotPine.Functions.Tools;
 /// <summary>
 /// Tools de contenido expuestos al agente (Claude/GPT).
 ///
-/// Estas funciones son llamadas por el LLM durante la generación de artículos.
-/// El agente decide cuándo y cómo usarlas basándose en sus instrucciones.
+/// Estas funciones se registran via AIFunctionFactory.Create() y se pasan
+/// al AIAgent del Agent Framework. El agente decide cuándo y cómo usarlas.
 ///
 /// Flujo típico:
 ///   1. El agente genera el contenido del artículo
@@ -28,7 +27,6 @@ public class ContentTools
         _logger = logger;
     }
 
-    [KernelFunction]
     [Description("Structures a complete blog article with affiliate link placeholders replaced. Call this after generating content to create the final article.")]
     public Task<Article> CreateArticleStructure(
         [Description("Main keyword for the article")] string keyword,
@@ -55,13 +53,11 @@ public class ContentTools
         return Task.FromResult(article);
     }
 
-    [KernelFunction]
     [Description("Generates headline variations for Pinterest pins based on the article title.")]
     public Task<List<string>> GeneratePinHeadlines(
         [Description("The article title")] string articleTitle,
         [Description("Number of variations to generate")] int count = 3)
     {
-        // El agente puede generar mejores headlines, pero esto da estructura base
         var headlines = new List<string>
         {
             articleTitle,

@@ -1,11 +1,10 @@
+using Microsoft.Agents.AI;
+using Microsoft.Agents.AI.DurableTask;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.Agents;
-using Microsoft.SemanticKernel.ChatCompletion;
 using PilotPine.Functions.Infrastructure;
 using PilotPine.Functions.Models;
 using PilotPine.Functions.Tools;
@@ -13,7 +12,7 @@ using PilotPine.Functions.Tools;
 namespace PilotPine.Functions.Functions;
 
 /// <summary>
-/// Orquestador principal con Durable Functions.
+/// Orquestador principal con Durable Functions + Agent Framework.
 ///
 /// Approach híbrido (ver docs/TOOLS-VS-DIRECT-CALLS.md):
 ///   - GetKeywords: directo (mecánico)
@@ -26,7 +25,6 @@ namespace PilotPine.Functions.Functions;
 /// </summary>
 public class DailyOrchestrator
 {
-    private readonly Kernel _kernel;
     private readonly FoundryModelProvider _foundryProvider;
     private readonly StateManager _stateManager;
     private readonly ResearchTools _researchTools;
@@ -37,7 +35,6 @@ public class DailyOrchestrator
     private readonly ILogger<DailyOrchestrator> _logger;
 
     public DailyOrchestrator(
-        Kernel kernel,
         FoundryModelProvider foundryProvider,
         StateManager stateManager,
         ResearchTools researchTools,
@@ -47,7 +44,6 @@ public class DailyOrchestrator
         ImageTools imageTools,
         ILogger<DailyOrchestrator> logger)
     {
-        _kernel = kernel;
         _foundryProvider = foundryProvider;
         _stateManager = stateManager;
         _researchTools = researchTools;
@@ -165,7 +161,7 @@ public class DailyOrchestrator
         try
         {
             // Paso 1: Generar artículo con AGENT + TOOLS (LLM decide contenido)
-            // >>> Checkpoint: $0.06 de Claude, no se repite si falla después <<<
+            // >>> Checkpoint: ~$0.06 de Claude, no se repite si falla después <<<
             var article = await context.CallActivityAsync<Article>(
                 nameof(GenerateArticleActivity),
                 input,
@@ -250,85 +246,36 @@ public class DailyOrchestrator
     public async Task<Article> GenerateArticleActivity(
         [ActivityTrigger] ArticleInput input)
     {
-        // ─── Approach: Agent + Tools ────────────────────────────────
-        // Creamos un kernel específico con los ContentTools registrados.
-        // El agente (Claude) genera el contenido y llama a
+        // ─── Approach: Durable Agent + Tools (Agent Framework) ──────
+        // Obtenemos el agente ContentWriter registrado en Program.cs.
+        // El agente (Claude via Foundry) genera el contenido y llama a
         // CreateArticleStructure para empaquetarlo.
 
-        var kernel = _foundryProvider.CreateKernelForModel();
-        kernel.Plugins.AddFromObject(_contentTools, "Content");
+        var agent = DurableAgentContext.Current.GetAgent("ContentWriter");
+        var session = await agent.CreateSessionAsync();
 
-        var agent = new ChatCompletionAgent
+        // El agente genera contenido y llama al tool CreateArticleStructure
+        var response = await agent.RunAsync<Article>(
+            message: $"Write a {input.ArticleType} about: {input.Keyword}",
+            session: session);
+
+        if (response.Result != null)
         {
-            Name = "ContentWriter",
-            Instructions = $"""
-                You are an expert travel content writer.
-
-                Your task: Create a {input.ArticleType} article about "{input.Keyword}"
-
-                Requirements:
-                - Catchy title including the current year
-                - 1500-2000 words in HTML format
-                - Use [HOTEL_LINK] where you recommend hotels
-                - Use [TOUR_LINK] where you recommend tours/activities
-                - Meta description of max 155 characters
-                - Informative but friendly tone
-                - Include practical tips and insider knowledge
-
-                IMPORTANT: After generating the content, call the CreateArticleStructure
-                tool to save the article with all fields filled in.
-                """,
-            Kernel = kernel,
-            Arguments = new KernelArguments(
-                new PromptExecutionSettings
-                {
-                    FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
-                }
-            )
-        };
-
-        var chat = new ChatHistory();
-        chat.AddUserMessage($"Write a {input.ArticleType} about: {input.Keyword}");
-
-        // El agente genera contenido y llama a CreateArticleStructure
-        Article? result = null;
-        await foreach (var response in agent.InvokeAsync(chat))
-        {
-            // Intentar extraer el Article del último tool call
-            if (response.Content != null)
-            {
-                _logger.LogDebug("Agent response: {Content}", response.Content[..Math.Min(200, response.Content.Length)]);
-            }
+            _logger.LogInformation("Agent generated article: {Title}", response.Result.Title);
+            return response.Result;
         }
 
-        // Si el agente no llamó al tool, generar directamente
-        if (result == null)
-        {
-            _logger.LogWarning("Agent did not call CreateArticleStructure, using direct generation");
+        // Fallback: si el agente no retornó structured output,
+        // crear el artículo directamente
+        _logger.LogWarning("Agent did not return structured Article, using direct generation");
 
-            // Fallback: llamada directa al LLM para generar contenido
-            var chatService = kernel.GetRequiredService<IChatCompletionService>();
-            var directChat = new ChatHistory();
-            directChat.AddSystemMessage(
-                "You are a travel content writer. Write in HTML format. " +
-                "Use [HOTEL_LINK] for hotel recommendations and [TOUR_LINK] for tour recommendations.");
-            directChat.AddUserMessage(
-                $"Write a {input.ArticleType} article about: {input.Keyword}. " +
-                "Include a title, 1500 words of content, and a meta description.");
-
-            var directResponse = await chatService.GetChatMessageContentAsync(directChat);
-            var content = directResponse.Content ?? "";
-
-            result = await _contentTools.CreateArticleStructure(
-                input.Keyword,
-                input.ArticleType,
-                $"Best {input.Keyword} Guide {DateTime.UtcNow.Year}",
-                content,
-                $"Discover the best {input.Keyword}. Local tips and insider secrets."
-            );
-        }
-
-        return result;
+        return await _contentTools.CreateArticleStructure(
+            input.Keyword,
+            input.ArticleType,
+            $"Best {input.Keyword} Guide {DateTime.UtcNow.Year}",
+            response.ToString() ?? "",
+            $"Discover the best {input.Keyword}. Local tips and insider secrets."
+        );
     }
 
     [Function(nameof(GeneratePinImagesActivity))]
