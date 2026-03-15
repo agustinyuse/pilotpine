@@ -3,6 +3,7 @@ using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.DurableTask;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using PilotPine.Functions.Infrastructure;
 using PilotPine.Functions.Models;
@@ -23,17 +24,25 @@ public class MercadoLibreEndpoints
     private readonly MercadoLibreTools _mlTools;
     private readonly FoundryModelProvider _foundryProvider;
     private readonly MercadoLibreContentTools _mlContentTools;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<MercadoLibreEndpoints> _logger;
+
+    private static readonly MemoryCacheEntryOptions CacheOptions = new()
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(30)
+    };
 
     public MercadoLibreEndpoints(
         MercadoLibreTools mlTools,
         FoundryModelProvider foundryProvider,
         MercadoLibreContentTools mlContentTools,
+        IMemoryCache cache,
         ILogger<MercadoLibreEndpoints> logger)
     {
         _mlTools = mlTools;
         _foundryProvider = foundryProvider;
         _mlContentTools = mlContentTools;
+        _cache = cache;
         _logger = logger;
     }
 
@@ -159,12 +168,21 @@ public class MercadoLibreEndpoints
                     .ToList()
             };
 
+            // Cachear el post para que FinalizeProductPost lo pueda recuperar
+            var cacheKey = $"product_post:{query.ToLowerInvariant().Trim()}";
+            _cache.Set(cacheKey, finalPost, CacheOptions);
+            _logger.LogInformation("Cached post for query '{Query}' (key: {CacheKey})", query, cacheKey);
+
+            // String listo para pegar directo en el Generador de links de ML
+            var permalinksForGenerator = string.Join("\n", finalPost.PermalinksToConvert);
+
             var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
             await response.WriteAsJsonAsync(new
             {
                 post = finalPost,
                 permalinks_to_convert = finalPost.PermalinksToConvert,
-                instructions = "Copiá los permalinks y pegalos en el Generador de links de ML para obtener los meli.la. Luego usá POST /api/ReplaceAffiliateLinks para reemplazarlos en el post."
+                permalinks_for_generator = permalinksForGenerator,
+                instructions = "Copiá el campo 'permalinks_for_generator' y pegalo directo en el Generador de links de ML (https://www.mercadolibre.com.ar/afiliados/generador-de-links). Luego usá POST /api/FinalizeProductPost con los meli.la para obtener el post final."
             });
             return response;
         }
@@ -226,10 +244,86 @@ public class MercadoLibreEndpoints
         return response;
     }
 
+    /// <summary>
+    /// Recupera el post cacheado y reemplaza permalinks con affiliate links.
+    /// POST /api/FinalizeProductPost
+    /// Body: { "query": "auriculares", "affiliateLinks": ["https://meli.la/abc", ...] }
+    ///
+    /// Requiere haber llamado GenerateProductPost previamente con la misma query (cache de 30 min).
+    /// </summary>
+    [Function("FinalizeProductPost")]
+    public async Task<HttpResponseData> FinalizeProductPost(
+        [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+    {
+        var body = await req.ReadFromJsonAsync<FinalizePostRequest>();
+
+        if (body == null || string.IsNullOrEmpty(body.Query))
+        {
+            var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await badRequest.WriteAsJsonAsync(new { error = "Body must include 'query' and 'affiliateLinks'" });
+            return badRequest;
+        }
+
+        var cacheKey = $"product_post:{body.Query.ToLowerInvariant().Trim()}";
+
+        if (!_cache.TryGetValue<ProductPost>(cacheKey, out var cachedPost) || cachedPost == null)
+        {
+            var notFound = req.CreateResponse(System.Net.HttpStatusCode.NotFound);
+            await notFound.WriteAsJsonAsync(new
+            {
+                error = $"No hay post cacheado para la query '{body.Query}'. Llamá primero a POST /api/GenerateProductPost?q={body.Query}",
+                hint = "El cache dura 30 minutos desde la generación."
+            });
+            return notFound;
+        }
+
+        if (body.AffiliateLinks.Count != cachedPost.PermalinksToConvert.Count)
+        {
+            var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await badRequest.WriteAsJsonAsync(new
+            {
+                error = $"Se esperaban {cachedPost.PermalinksToConvert.Count} affiliate links pero se recibieron {body.AffiliateLinks.Count}.",
+                expected_count = cachedPost.PermalinksToConvert.Count,
+                permalinks = cachedPost.PermalinksToConvert
+            });
+            return badRequest;
+        }
+
+        var finalContent = cachedPost.Content;
+        var replacements = 0;
+
+        for (var i = 0; i < cachedPost.PermalinksToConvert.Count; i++)
+        {
+            if (finalContent.Contains(cachedPost.PermalinksToConvert[i]))
+            {
+                finalContent = finalContent.Replace(cachedPost.PermalinksToConvert[i], body.AffiliateLinks[i]);
+                replacements++;
+            }
+        }
+
+        _logger.LogInformation("FinalizeProductPost: replaced {Count} links for query '{Query}'", replacements, body.Query);
+
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        await response.WriteAsJsonAsync(new
+        {
+            finalContent,
+            title = cachedPost.Title,
+            replacements,
+            ready = true
+        });
+        return response;
+    }
+
     private record ReplaceLinksRequest
     {
         public string PostContent { get; init; } = "";
         public List<string> Permalinks { get; init; } = [];
+        public List<string> AffiliateLinks { get; init; } = [];
+    }
+
+    private record FinalizePostRequest
+    {
+        public string Query { get; init; } = "";
         public List<string> AffiliateLinks { get; init; } = [];
     }
 }

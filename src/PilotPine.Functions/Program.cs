@@ -35,6 +35,9 @@ builder.Services.AddSingleton<StateManager>(sp =>
 // ─── HTTP Client ─────────────────────────────────────────────────
 builder.Services.AddHttpClient();
 
+// ─── In-Memory Cache (para cachear posts generados 30 min) ───────
+builder.Services.AddMemoryCache();
+
 // ─── Tools: Agent-facing (expuestos al LLM via Agent Framework) ──
 builder.Services.AddSingleton<ResearchTools>();
 builder.Services.AddSingleton<ContentTools>();
