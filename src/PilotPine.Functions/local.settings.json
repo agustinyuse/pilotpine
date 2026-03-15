@@ -23,6 +23,9 @@
     "Bannerbear__Templates__listicle": "",
     "Bannerbear__Templates__guide": "",
 
+    "MercadoLibre__SiteId": "MLA",
+    "MercadoLibre__AffiliateProfileId": "ya20250520231535",
+
     "State__StoragePath": "./state"
   }
 }

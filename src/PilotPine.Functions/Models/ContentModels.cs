@@ -42,3 +42,39 @@ public record PinResult
     public string? PinId { get; init; }
     public string? Error { get; init; }
 }
+
+// ─── Mercado Libre Models ────────────────────────────────────────
+
+/// <summary>
+/// Producto de Mercado Libre obtenido via API pública.
+/// </summary>
+public record MercadoLibreProduct
+{
+    public required string Id { get; init; }
+    public required string Title { get; init; }
+    public decimal Price { get; init; }
+    public decimal? OriginalPrice { get; init; }
+    public string CurrencyId { get; init; } = "ARS";
+    public required string Permalink { get; init; }
+    public string Thumbnail { get; init; } = "";
+    public string Condition { get; init; } = "new";
+    public int SoldQuantity { get; init; }
+    public bool FreeShipping { get; init; }
+    public string SellerName { get; init; } = "";
+}
+
+/// <summary>
+/// Post de producto generado por Claude, listo para compartir.
+/// </summary>
+public record ProductPost
+{
+    public required string Title { get; init; }
+    public required string Content { get; init; }
+    public string MetaDescription { get; init; } = "";
+    public string[] Tags { get; init; } = [];
+    public List<MercadoLibreProduct> Products { get; init; } = [];
+    /// <summary>
+    /// Lista de permalinks para convertir en el Generador de links de ML.
+    /// </summary>
+    public List<string> PermalinksToConvert { get; init; } = [];
+}
