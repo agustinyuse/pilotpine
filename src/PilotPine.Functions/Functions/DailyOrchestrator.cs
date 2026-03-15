@@ -19,6 +19,7 @@ namespace PilotPine.Functions.Functions;
 ///   - GenerateArticle: DurableAIAgent en la orquestación (checkpointed)
 ///   - PublishToWordPress: directo (mecánico)
 ///   - GenerateImages + CreatePins: directo (mecánico)
+///   - Product posts: ML trends → search → ProductWriter agent → WP → Pinterest
 /// </summary>
 public class DailyOrchestrator
 {
@@ -28,6 +29,8 @@ public class DailyOrchestrator
     private readonly WordPressTools _wordPressTools;
     private readonly PinterestTools _pinterestTools;
     private readonly ImageTools _imageTools;
+    private readonly MercadoLibreTools _mlTools;
+    private readonly MercadoLibreContentTools _mlContentTools;
     private readonly ILogger<DailyOrchestrator> _logger;
 
     public DailyOrchestrator(
@@ -37,6 +40,8 @@ public class DailyOrchestrator
         WordPressTools wordPressTools,
         PinterestTools pinterestTools,
         ImageTools imageTools,
+        MercadoLibreTools mlTools,
+        MercadoLibreContentTools mlContentTools,
         ILogger<DailyOrchestrator> logger)
     {
         _stateManager = stateManager;
@@ -45,6 +50,8 @@ public class DailyOrchestrator
         _wordPressTools = wordPressTools;
         _pinterestTools = pinterestTools;
         _imageTools = imageTools;
+        _mlTools = mlTools;
+        _mlContentTools = mlContentTools;
         _logger = logger;
     }
 
@@ -101,37 +108,69 @@ public class DailyOrchestrator
     {
         var input = context.GetInput<PipelineInput>();
         var logger = context.CreateReplaySafeLogger<DailyOrchestrator>();
-        var results = new List<ArticleResult>();
+        var articleResults = new List<ArticleResult>();
+        var productResults = new List<ProductPostResult>();
 
-        // Paso 1: Research keywords (directo, mecánico)
+        // ═══ Travel Articles Pipeline ═══
+
+        // Paso 1: Research keywords de viaje (directo, mecánico)
         var keywords = await context.CallActivityAsync<List<KeywordResult>>(
             nameof(GetKeywordsActivity),
             input!.ArticleCount
         );
-        logger.LogInformation("Keywords found: {Count}", keywords.Count);
+        logger.LogInformation("Travel keywords found: {Count}", keywords.Count);
 
-        // Paso 2: Procesar cada keyword (sub-orquestación con checkpoints)
+        // Paso 2: Procesar cada keyword de viaje (sub-orquestación con checkpoints)
         foreach (var kw in keywords)
         {
             var result = await context.CallSubOrchestratorAsync<ArticleResult>(
                 nameof(ProcessArticleOrchestration),
                 new ArticleInput { Keyword = kw.Keyword, ArticleType = kw.ArticleType }
             );
-            results.Add(result);
+            articleResults.Add(result);
         }
 
-        // Paso 3: Guardar resultados del día
+        // ═══ Product Posts Pipeline ═══
+
+        // Paso 3: Research keywords de productos (ML trends dinámico)
+        var productKeywords = await context.CallActivityAsync<List<string>>(
+            nameof(GetProductKeywordsActivity),
+            input.ProductPostCount
+        );
+        logger.LogInformation("Product keywords found: {Count}", productKeywords.Count);
+
+        // Paso 4: Procesar cada keyword de producto (sub-orquestación)
+        foreach (var keyword in productKeywords)
+        {
+            var result = await context.CallSubOrchestratorAsync<ProductPostResult>(
+                nameof(ProcessProductPostOrchestration),
+                new ProductPostInput { Keyword = keyword }
+            );
+            productResults.Add(result);
+        }
+
+        // ═══ Guardar resultados ═══
+
         await context.CallActivityAsync(
             nameof(SaveResultsActivity),
-            results
+            articleResults
         );
+        await context.CallActivityAsync(
+            nameof(SaveProductResultsActivity),
+            productResults
+        );
+
+        var allErrors = articleResults.Where(r => !r.Success).Select(r => r.Error!)
+            .Concat(productResults.Where(r => !r.Success).Select(r => r.Error!))
+            .ToList();
 
         return new PipelineResult
         {
             Date = context.CurrentUtcDateTime,
-            ArticlesPublished = results.Count(r => r.Success),
-            TotalPinsCreated = results.Sum(r => r.PinsCreated),
-            Errors = results.Where(r => !r.Success).Select(r => r.Error!).ToList()
+            ArticlesPublished = articleResults.Count(r => r.Success),
+            ProductPostsPublished = productResults.Count(r => r.Success),
+            TotalPinsCreated = articleResults.Sum(r => r.PinsCreated) + productResults.Sum(r => r.PinsCreated),
+            Errors = allErrors
         };
     }
 
@@ -222,6 +261,147 @@ public class DailyOrchestrator
         }
     }
 
+    /// <summary>
+    /// Sub-orquestación para procesar un product post de ML.
+    /// Flujo: search productos → generar post con ProductWriter → publicar WP → crear pin.
+    /// </summary>
+    [Function(nameof(ProcessProductPostOrchestration))]
+    public async Task<ProductPostResult> ProcessProductPostOrchestration(
+        [OrchestrationTrigger] TaskOrchestrationContext context)
+    {
+        var input = context.GetInput<ProductPostInput>();
+        var logger = context.CreateReplaySafeLogger<DailyOrchestrator>();
+
+        var apiRetry = new RetryPolicy(
+            maxNumberOfAttempts: 5,
+            firstRetryInterval: TimeSpan.FromSeconds(10),
+            backoffCoefficient: 2.0,
+            maxRetryInterval: TimeSpan.FromMinutes(3));
+
+        try
+        {
+            // Paso 1: Buscar productos en ML (activity)
+            var products = await context.CallActivityAsync<List<MercadoLibreProduct>>(
+                nameof(SearchMLProductsActivity),
+                input!
+            );
+
+            if (products.Count == 0)
+            {
+                logger.LogWarning("No products found for: {Keyword}", input.Keyword);
+                return new ProductPostResult
+                {
+                    Success = false,
+                    Keyword = input.Keyword,
+                    Error = $"No products found for: {input.Keyword}"
+                };
+            }
+            logger.LogInformation("Found {Count} products for: {Keyword}", products.Count, input.Keyword);
+
+            // Paso 2: Generar product post con ProductWriter DurableAgent
+            var productContext = string.Join("\n", products.Select((p, i) =>
+            {
+                var discount = p.OriginalPrice.HasValue && p.OriginalPrice > p.Price
+                    ? $" (antes ${p.OriginalPrice:N0}, {(1 - p.Price / p.OriginalPrice.Value) * 100:N0}% OFF)"
+                    : "";
+                var shipping = p.FreeShipping ? " | Envío gratis" : "";
+                return $"- [{p.Id}] {p.Title} — ${p.Price:N0} ARS{discount}{shipping}";
+            }));
+
+            DurableAIAgent agent = context.GetAgent("ProductWriter");
+            AgentSession session = await agent.CreateSessionAsync();
+            AgentResponse<ProductPost> response = await agent.RunAsync<ProductPost>(
+                message: $"""
+                    Creá un post corto para redes sociales recomendando estos productos de Mercado Libre.
+                    Búsqueda: "{input.Keyword}"
+
+                    Productos encontrados:
+                    {productContext}
+
+                    Recordá usar [PRODUCT_LINK:ITEM_ID] para cada producto (reemplazá ITEM_ID con el ID real).
+                    """,
+                session: session);
+
+            ProductPost post = response.Result
+                ?? throw new InvalidOperationException("ProductWriter agent did not return structured output");
+
+            logger.LogInformation("Product post generated: {Title}", post.Title);
+
+            // Paso 3: Reemplazar placeholders con affiliate links (automático)
+            var finalContent = post.Content;
+            foreach (var product in products)
+            {
+                var affiliateLink = _mlTools.BuildAffiliateLink(product.Permalink);
+                finalContent = finalContent.Replace($"[PRODUCT_LINK:{product.Id}]", affiliateLink);
+            }
+
+            // Convertir ProductPost a Article para publicar en WordPress
+            var article = new Article
+            {
+                Title = post.Title,
+                Content = finalContent,
+                MetaDescription = post.MetaDescription,
+                Category = "productos",
+                Tags = post.Tags
+            };
+
+            // Paso 4: Publicar en WordPress (directo, mecánico)
+            var wpResult = await context.CallActivityAsync<PublishResult>(
+                nameof(PublishToWordPressActivity),
+                article,
+                TaskOptions.FromRetryPolicy(apiRetry)
+            );
+
+            if (!wpResult.Success)
+            {
+                logger.LogWarning("WordPress publish failed for product post: {Error}", wpResult.Error);
+                return new ProductPostResult
+                {
+                    Success = false,
+                    Keyword = input.Keyword,
+                    ProductCount = products.Count,
+                    Error = wpResult.Error
+                };
+            }
+            logger.LogInformation("Product post published: {Url}", wpResult.PostUrl);
+
+            // Paso 5: Crear pin en Pinterest con thumbnail del primer producto
+            var pinResults = await context.CallActivityAsync<List<PinResult>>(
+                nameof(CreateProductPinsActivity),
+                new CreateProductPinsInput
+                {
+                    PostUrl = wpResult.PostUrl!,
+                    PostTitle = post.Title,
+                    Description = post.MetaDescription,
+                    Products = products
+                },
+                TaskOptions.FromRetryPolicy(apiRetry)
+            );
+
+            var successPins = pinResults.Count(p => p.Success);
+            logger.LogInformation("Product pins created: {Success}/{Total}", successPins, pinResults.Count);
+
+            return new ProductPostResult
+            {
+                Success = true,
+                Keyword = input.Keyword,
+                PostUrl = wpResult.PostUrl,
+                ProductCount = products.Count,
+                PinsCreated = successPins
+            };
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Product post failed: {Keyword}", input!.Keyword);
+            return new ProductPostResult
+            {
+                Success = false,
+                Keyword = input.Keyword,
+                Error = ex.Message
+            };
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // ACTIVITIES - Cada una es una unidad atómica con checkpoint
     // ═══════════════════════════════════════════════════════════════
@@ -287,7 +467,67 @@ public class DailyOrchestrator
             }
         );
 
-        _logger.LogInformation("Results saved: {Success}/{Total}",
+        _logger.LogInformation("Article results saved: {Success}/{Total}",
+            results.Count(r => r.Success), results.Count);
+    }
+
+    // ─── Product Post Activities ────────────────────────────────
+
+    [Function(nameof(GetProductKeywordsActivity))]
+    public async Task<List<string>> GetProductKeywordsActivity(
+        [ActivityTrigger] int count)
+    {
+        return await _researchTools.GetProductKeywords(count);
+    }
+
+    [Function(nameof(SearchMLProductsActivity))]
+    public async Task<List<MercadoLibreProduct>> SearchMLProductsActivity(
+        [ActivityTrigger] ProductPostInput input)
+    {
+        return await _mlTools.SearchProductsAsync(input.Keyword, input.ProductLimit);
+    }
+
+    [Function(nameof(CreateProductPinsActivity))]
+    public async Task<List<PinResult>> CreateProductPinsActivity(
+        [ActivityTrigger] CreateProductPinsInput input)
+    {
+        // Usar el thumbnail del primer producto como imagen del pin
+        var variations = new List<PinVariation>();
+
+        if (input.Products.Count > 0)
+        {
+            var mainProduct = input.Products[0];
+            var imageUrl = !string.IsNullOrEmpty(mainProduct.Thumbnail)
+                ? mainProduct.Thumbnail
+                : $"https://source.unsplash.com/1000x1500/?{Uri.EscapeDataString(input.PostTitle)}";
+
+            variations.Add(new PinVariation
+            {
+                Title = input.PostTitle,
+                ImageUrl = imageUrl
+            });
+        }
+
+        return await _pinterestTools.CreatePinsWithRateLimitAsync(
+            input.PostUrl,
+            input.Description,
+            variations
+        );
+    }
+
+    [Function(nameof(SaveProductResultsActivity))]
+    public async Task SaveProductResultsActivity(
+        [ActivityTrigger] List<ProductPostResult> results)
+    {
+        var date = DateTime.UtcNow.ToString("yyyy-MM-dd");
+        await _stateManager.SaveAsync($"daily-product-results/{date}", results);
+
+        foreach (var result in results.Where(r => r.Success))
+        {
+            await _researchTools.MarkProductKeywordAsPublished(result.Keyword);
+        }
+
+        _logger.LogInformation("Product results saved: {Success}/{Total}",
             results.Count(r => r.Success), results.Count);
     }
 }
@@ -305,4 +545,12 @@ public record CreatePinsInput
     public string PostUrl { get; init; } = "";
     public string Description { get; init; } = "";
     public List<PinVariation> Variations { get; init; } = [];
+}
+
+public record CreateProductPinsInput
+{
+    public string PostUrl { get; init; } = "";
+    public string PostTitle { get; init; } = "";
+    public string Description { get; init; } = "";
+    public List<MercadoLibreProduct> Products { get; init; } = [];
 }
