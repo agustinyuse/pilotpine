@@ -39,12 +39,16 @@ builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ResearchTools>();
 builder.Services.AddSingleton<ContentTools>();
 
+// ─── Tools: Agent-facing (ML products) ───────────────────────────
+builder.Services.AddSingleton<MercadoLibreContentTools>();
+
 // ─── Tools: Direct-call (llamados desde el orchestrator) ─────────
 // Estos NO se registran como tools del agente.
 // Son llamadas directas porque publicar es mecánico.
 builder.Services.AddSingleton<WordPressTools>();
 builder.Services.AddSingleton<PinterestTools>();
 builder.Services.AddSingleton<ImageTools>();
+builder.Services.AddSingleton<MercadoLibreTools>();
 
 // ─── Observability ───────────────────────────────────────────────
 builder.Services.AddApplicationInsightsTelemetryWorkerService();
@@ -71,12 +75,32 @@ const string ContentWriterInstructions =
     the task. Never return content without calling the tool.
     """;
 
+// ─── ProductWriter Agent ─────────────────────────────────────────
+const string ProductWriterName = "ProductWriter";
+const string ProductWriterInstructions =
+    """
+    Sos un experto en recomendaciones de productos para el mercado argentino.
+    Escribís posts cortos para redes sociales en español argentino (100-300 palabras).
+
+    Formato para cada producto:
+    - Emoji llamativo + título del producto
+    - 2-3 características clave como bullet points (✅)
+    - Precio con porcentaje de descuento si aplica
+    - Badge de envío gratis si está disponible
+    - Usá [PRODUCT_LINK:ITEM_ID] como placeholder del link (reemplazá ITEM_ID con el ID real del producto)
+
+    Tono: casual, directo, persuasivo. Usá español argentino (vos, comprá, mirá, etc.)
+
+    IMPORTANTE: Después de generar el contenido, DEBÉS llamar al tool CreateProductPost
+    para guardar el post con todos los campos completos. Nunca devuelvas contenido
+    sin llamar al tool.
+    """;
+
 builder
     .ConfigureFunctionsWebApplication()
     .ConfigureDurableAgents(options =>
     {
-        // ContentWriter: agente con tools para generar artículos.
-        // Usa AddAIAgentFactory porque necesitamos DI (ContentTools).
+        // ContentWriter: agente con tools para generar artículos de viaje.
         options.AddAIAgentFactory(ContentWriterName, sp =>
         {
             var contentTools = sp.GetRequiredService<ContentTools>();
@@ -88,6 +112,20 @@ builder
                 tools: [
                     AIFunctionFactory.Create(contentTools.CreateArticleStructure),
                     AIFunctionFactory.Create(contentTools.GeneratePinHeadlines),
+                ]);
+        });
+
+        // ProductWriter: agente para posts de productos ML.
+        options.AddAIAgentFactory(ProductWriterName, sp =>
+        {
+            var mlContentTools = sp.GetRequiredService<MercadoLibreContentTools>();
+
+            return foundryProvider.GetChatClient().AsAIAgent(
+                instructions: ProductWriterInstructions,
+                name: ProductWriterName,
+                services: sp,
+                tools: [
+                    AIFunctionFactory.Create(mlContentTools.CreateProductPost),
                 ]);
         });
     });
