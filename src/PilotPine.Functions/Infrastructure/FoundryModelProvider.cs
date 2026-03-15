@@ -16,8 +16,8 @@ namespace PilotPine.Functions.Infrastructure;
 ///   - mistral-large (Mistral via Foundry)
 ///   - etc.
 ///
-/// Ahora usa AzureOpenAIClient (compatible con Foundry) en lugar de
-/// Azure.AI.Inference, y crea AIAgent del Microsoft Agent Framework.
+/// Usa AzureOpenAIClient (compatible con Foundry) y crea
+/// AIAgent del Microsoft Agent Framework.
 /// </summary>
 public class FoundryModelProvider
 {
@@ -37,11 +37,7 @@ public class FoundryModelProvider
     public AzureOpenAIClient Client => _client;
 
     /// <summary>
-    /// Obtiene un ChatClient para un modelo específico de Foundry.
-    ///
-    /// Ejemplo:
-    ///   var chat = provider.GetChatClient("gpt-4o");
-    ///   var chat = provider.GetChatClient("claude-sonnet-4-5");
+    /// Obtiene un ChatClient (OpenAI SDK) para un modelo específico de Foundry.
     /// </summary>
     public ChatClient GetChatClient(string? modelId = null)
     {
@@ -49,26 +45,32 @@ public class FoundryModelProvider
     }
 
     /// <summary>
+    /// Obtiene un IChatClient (Microsoft.Extensions.AI) para un modelo específico.
+    /// </summary>
+    public IChatClient GetIChatClient(string? modelId = null)
+    {
+        return GetChatClient(modelId).AsIChatClient();
+    }
+
+    /// <summary>
     /// Crea un AIAgent del Agent Framework sin tools.
-    /// Útil para agentes simples que solo necesitan instrucciones.
     /// </summary>
     public AIAgent CreateAgent(string name, string instructions, string? modelId = null)
     {
-        return GetChatClient(modelId).AsAIAgent(instructions, name);
+        return GetIChatClient(modelId).AsAIAgent(instructions, name);
     }
 
     /// <summary>
     /// Crea un AIAgent del Agent Framework con tools.
-    /// Útil para agentes que necesitan llamar funciones.
     /// </summary>
     public AIAgent CreateAgentWithTools(
         string name,
         string instructions,
         IServiceProvider services,
-        AIFunction[] tools,
+        AITool[] tools,
         string? modelId = null)
     {
-        return GetChatClient(modelId).AsAIAgent(
+        return GetIChatClient(modelId).AsAIAgent(
             instructions: instructions,
             name: name,
             services: services,

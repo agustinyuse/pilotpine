@@ -14,18 +14,14 @@ namespace PilotPine.Functions.Functions;
 /// <summary>
 /// Orquestador principal con Durable Functions + Agent Framework.
 ///
-/// Approach híbrido (ver docs/TOOLS-VS-DIRECT-CALLS.md):
+/// Approach híbrido:
 ///   - GetKeywords: directo (mecánico)
-///   - GenerateArticle: AGENT + TOOLS (el LLM decide estructura/contenido)
+///   - GenerateArticle: DurableAIAgent en la orquestación (checkpointed)
 ///   - PublishToWordPress: directo (mecánico)
 ///   - GenerateImages + CreatePins: directo (mecánico)
-///
-/// Durable Functions guarda checkpoint después de cada await.
-/// Si falla en paso 3, NO repite el paso 2 (que costó tokens).
 /// </summary>
 public class DailyOrchestrator
 {
-    private readonly FoundryModelProvider _foundryProvider;
     private readonly StateManager _stateManager;
     private readonly ResearchTools _researchTools;
     private readonly ContentTools _contentTools;
@@ -35,7 +31,6 @@ public class DailyOrchestrator
     private readonly ILogger<DailyOrchestrator> _logger;
 
     public DailyOrchestrator(
-        FoundryModelProvider foundryProvider,
         StateManager stateManager,
         ResearchTools researchTools,
         ContentTools contentTools,
@@ -44,7 +39,6 @@ public class DailyOrchestrator
         ImageTools imageTools,
         ILogger<DailyOrchestrator> logger)
     {
-        _foundryProvider = foundryProvider;
         _stateManager = stateManager;
         _researchTools = researchTools;
         _contentTools = contentTools;
@@ -119,7 +113,7 @@ public class DailyOrchestrator
         // Paso 2: Procesar cada keyword (sub-orquestación con checkpoints)
         foreach (var kw in keywords)
         {
-            var result = await context.CallSubOrchestrationAsync<ArticleResult>(
+            var result = await context.CallSubOrchestratorAsync<ArticleResult>(
                 nameof(ProcessArticleOrchestration),
                 new ArticleInput { Keyword = kw.Keyword, ArticleType = kw.ArticleType }
             );
@@ -148,31 +142,29 @@ public class DailyOrchestrator
         var input = context.GetInput<ArticleInput>();
         var logger = context.CreateReplaySafeLogger<DailyOrchestrator>();
 
-        var llmRetry = new TaskRetryOptions(
-            firstRetryInterval: TimeSpan.FromSeconds(30),
-            maxNumberOfAttempts: 3)
-        { BackoffCoefficient = 1.5 };
-
-        var apiRetry = new TaskRetryOptions(
+        var apiRetry = new RetryPolicy(
+            maxNumberOfAttempts: 5,
             firstRetryInterval: TimeSpan.FromSeconds(10),
-            maxNumberOfAttempts: 5)
-        { BackoffCoefficient = 2.0, MaxRetryInterval = TimeSpan.FromMinutes(3) };
+            backoffCoefficient: 2.0,
+            maxRetryInterval: TimeSpan.FromMinutes(3));
 
         try
         {
-            // Paso 1: Generar artículo con AGENT + TOOLS (LLM decide contenido)
-            // >>> Checkpoint: ~$0.06 de Claude, no se repite si falla después <<<
-            var article = await context.CallActivityAsync<Article>(
-                nameof(GenerateArticleActivity),
-                input,
-                new TaskActivityOptions { Retry = llmRetry }
-            );
+            // Paso 1: Generar artículo con DurableAIAgent (checkpointed por el framework)
+            DurableAIAgent agent = context.GetAgent("ContentWriter");
+            AgentSession session = await agent.CreateSessionAsync();
+            AgentResponse<Article> response = await agent.RunAsync<Article>(
+                message: $"Write a {input!.ArticleType} about: {input.Keyword}",
+                session: session);
+
+            Article article = response.Result
+                ?? throw new InvalidOperationException("Agent did not return structured Article output");
             logger.LogInformation("Article generated: {Title}", article.Title);
 
             // Paso 2: Generar imágenes para pins (directo, mecánico)
             var pinVariations = await context.CallActivityAsync<List<PinVariation>>(
                 nameof(GeneratePinImagesActivity),
-                new PinImageInput { ArticleTitle = article.Title, Keyword = input!.Keyword }
+                new PinImageInput { ArticleTitle = article.Title, Keyword = input.Keyword }
             );
             logger.LogInformation("Pin images generated: {Count}", pinVariations.Count);
 
@@ -180,7 +172,7 @@ public class DailyOrchestrator
             var wpResult = await context.CallActivityAsync<PublishResult>(
                 nameof(PublishToWordPressActivity),
                 article,
-                new TaskActivityOptions { Retry = apiRetry }
+                TaskOptions.FromRetryPolicy(apiRetry)
             );
 
             if (!wpResult.Success)
@@ -204,7 +196,7 @@ public class DailyOrchestrator
                     Description = article.MetaDescription,
                     Variations = pinVariations
                 },
-                new TaskActivityOptions { Retry = apiRetry }
+                TaskOptions.FromRetryPolicy(apiRetry)
             );
 
             var successPins = pinResults.Count(p => p.Success);
@@ -238,51 +230,13 @@ public class DailyOrchestrator
     public async Task<List<KeywordResult>> GetKeywordsActivity(
         [ActivityTrigger] int count)
     {
-        // Llamada directa al ResearchTools (no necesita el LLM para esto)
         return await _researchTools.GetKeywords(count);
-    }
-
-    [Function(nameof(GenerateArticleActivity))]
-    public async Task<Article> GenerateArticleActivity(
-        [ActivityTrigger] ArticleInput input)
-    {
-        // ─── Approach: Durable Agent + Tools (Agent Framework) ──────
-        // Obtenemos el agente ContentWriter registrado en Program.cs.
-        // El agente (Claude via Foundry) genera el contenido y llama a
-        // CreateArticleStructure para empaquetarlo.
-
-        var agent = DurableAgentContext.Current.GetAgent("ContentWriter");
-        var session = await agent.CreateSessionAsync();
-
-        // El agente genera contenido y llama al tool CreateArticleStructure
-        var response = await agent.RunAsync<Article>(
-            message: $"Write a {input.ArticleType} about: {input.Keyword}",
-            session: session);
-
-        if (response.Result != null)
-        {
-            _logger.LogInformation("Agent generated article: {Title}", response.Result.Title);
-            return response.Result;
-        }
-
-        // Fallback: si el agente no retornó structured output,
-        // crear el artículo directamente
-        _logger.LogWarning("Agent did not return structured Article, using direct generation");
-
-        return await _contentTools.CreateArticleStructure(
-            input.Keyword,
-            input.ArticleType,
-            $"Best {input.Keyword} Guide {DateTime.UtcNow.Year}",
-            response.ToString() ?? "",
-            $"Discover the best {input.Keyword}. Local tips and insider secrets."
-        );
     }
 
     [Function(nameof(GeneratePinImagesActivity))]
     public async Task<List<PinVariation>> GeneratePinImagesActivity(
         [ActivityTrigger] PinImageInput input)
     {
-        // Directo: generar headlines y luego imágenes
         var headlines = await _contentTools.GeneratePinHeadlines(input.ArticleTitle, 3);
         return await _imageTools.GeneratePinVariationsAsync(input.ArticleTitle, input.Keyword, headlines);
     }
@@ -291,7 +245,6 @@ public class DailyOrchestrator
     public async Task<PublishResult> PublishToWordPressActivity(
         [ActivityTrigger] Article article)
     {
-        // Directo: verificar duplicado, luego publicar
         if (await _wordPressTools.PostExistsAsync(article.Title))
         {
             _logger.LogWarning("Article already exists: {Title}", article.Title);
@@ -305,7 +258,6 @@ public class DailyOrchestrator
     public async Task<List<PinResult>> CreatePinsActivity(
         [ActivityTrigger] CreatePinsInput input)
     {
-        // Directo: crear pins con rate limiting
         return await _pinterestTools.CreatePinsWithRateLimitAsync(
             input.PostUrl,
             input.Description,
@@ -320,7 +272,6 @@ public class DailyOrchestrator
         var date = DateTime.UtcNow.ToString("yyyy-MM-dd");
         await _stateManager.SaveAsync($"daily-results/{date}", results);
 
-        // Actualizar keywords publicadas
         var successKeywords = results
             .Where(r => r.Success)
             .Select(r => r.Keyword.ToLowerInvariant());

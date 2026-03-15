@@ -105,7 +105,7 @@ builder
         {
             var contentTools = sp.GetRequiredService<ContentTools>();
 
-            return foundryProvider.GetChatClient().AsAIAgent(
+            return foundryProvider.GetChatClient().AsIChatClient().AsAIAgent(
                 instructions: ContentWriterInstructions,
                 name: ContentWriterName,
                 services: sp,
@@ -120,7 +120,7 @@ builder
         {
             var mlContentTools = sp.GetRequiredService<MercadoLibreContentTools>();
 
-            return foundryProvider.GetChatClient().AsAIAgent(
+            return foundryProvider.GetChatClient().AsIChatClient().AsAIAgent(
                 instructions: ProductWriterInstructions,
                 name: ProductWriterName,
                 services: sp,
