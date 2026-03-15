@@ -126,6 +126,46 @@ public class MercadoLibreTools
         }
     }
 
+    /// <summary>
+    /// Obtiene keywords trending de ML (/trends/MLA).
+    /// Usado por ResearchTools para research dinámico.
+    /// </summary>
+    public async Task<List<string>> GetTrendingKeywordsAsync(int limit = 10)
+    {
+        await EnsureTokenAsync();
+
+        try
+        {
+            var trends = await GetAsync<List<MlTrendItem>>($"{BaseUrl}/trends/{_siteId}");
+            if (trends == null || trends.Count == 0)
+            {
+                _logger.LogWarning("No trending keywords found");
+                return [];
+            }
+
+            var keywords = trends.Take(limit).Select(t => t.Keyword).ToList();
+            _logger.LogInformation("Trending keywords: {Count} found", keywords.Count);
+            return keywords;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "GetTrendingKeywords failed");
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Construye un affiliate link agregando tracking params al permalink.
+    /// Usa el app_id (client_id) como parámetro de tracking.
+    /// </summary>
+    public string BuildAffiliateLink(string permalink)
+    {
+        if (string.IsNullOrEmpty(permalink)) return permalink;
+
+        var separator = permalink.Contains('?') ? "&" : "?";
+        return $"{permalink}{separator}matt_tool=site&matt_word=pilotpine";
+    }
+
     // ─── Internal API calls ───────────────────────────────────────
 
     private async Task<string?> FindCategoryAsync(string query)

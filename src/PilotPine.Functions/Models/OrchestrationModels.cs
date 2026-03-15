@@ -6,6 +6,7 @@ namespace PilotPine.Functions.Models;
 public record PipelineInput
 {
     public int ArticleCount { get; init; } = 3;
+    public int ProductPostCount { get; init; } = 2;
     public DateTime Date { get; init; } = DateTime.UtcNow;
 }
 
@@ -16,6 +17,7 @@ public record PipelineResult
 {
     public DateTime Date { get; init; }
     public int ArticlesPublished { get; init; }
+    public int ProductPostsPublished { get; init; }
     public int TotalPinsCreated { get; init; }
     public List<string> Errors { get; init; } = [];
 }
@@ -37,6 +39,28 @@ public record ArticleResult
     public bool Success { get; init; }
     public string Keyword { get; init; } = "";
     public string? PostUrl { get; init; }
+    public int PinsCreated { get; init; }
+    public string? Error { get; init; }
+}
+
+/// <summary>
+/// Input para procesar un product post de ML.
+/// </summary>
+public record ProductPostInput
+{
+    public required string Keyword { get; init; }
+    public int ProductLimit { get; init; } = 5;
+}
+
+/// <summary>
+/// Resultado del procesamiento de un product post.
+/// </summary>
+public record ProductPostResult
+{
+    public bool Success { get; init; }
+    public string Keyword { get; init; } = "";
+    public string? PostUrl { get; init; }
+    public int ProductCount { get; init; }
     public int PinsCreated { get; init; }
     public string? Error { get; init; }
 }
